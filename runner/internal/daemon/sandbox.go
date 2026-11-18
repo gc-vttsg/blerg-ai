@@ -92,7 +92,39 @@ var dockerRun = func(args ...string) error {
 	return dockerError(cmd.Run(), stderr.Bytes())
 }
 
-// dockerError adds the last line of docker's stderr (with the line before a usage hint) to a failed call's error, so a failure reads
+// dockerAcceptsBlkioWeight reports whether the Docker host can apply --blkio-weight. Docker
+// Desktop's VM runs the "none" I/O scheduler (no io.weight / io.bfq.weight), so a container started
+// with the flag fails in runc ("error setting cgroup config"), and every sandbox with
+// yieldToPerson on would fail to start. Probed once per daemon: the flag is reported unsupported
+// only when a throwaway container fails with it and starts without it; anything else (Docker
+// down, image missing) is not cached and keeps the flag. A var so tests can stub it.
+var dockerAcceptsBlkioWeight = func() bool {
+	blkioProbe.mu.Lock()
+	defer blkioProbe.mu.Unlock()
+	if blkioProbe.known {
+		return blkioProbe.supported
+	}
+	img := sandboxImage()
+	switch {
+	case dockerRun("run", "--rm", "--pull=never", "--blkio-weight", "100", img, "true") == nil:
+		blkioProbe.supported, blkioProbe.known = true, true
+	case dockerRun("run", "--rm", "--pull=never", img, "true") == nil:
+		blkioProbe.supported, blkioProbe.known = false, true
+		log.Printf("sandbox: this Docker host cannot apply --blkio-weight; interactive-priority sandboxes keep --cpu-shares only")
+	default:
+		return true
+	}
+	return blkioProbe.supported
+}
+
+var blkioProbe struct {
+	mu        sync.Mutex
+	known     bool
+	supported bool
+}
+
+// dockerError adds the last line of docker's stderr (with the line before a usage hint) to a
+// failed call's error, so a failure reads
 // "exit status 125: docker: Error response from daemon: …" instead of a bare exit status. Docker
 // prints no secret values there: the daemon passes secrets as `-e NAME`, never NAME=value.
 func dockerError(err error, stderr []byte) error {
@@ -453,7 +485,10 @@ var sandboxTestMounts []string
 // sandboxRunExtras are the per-start additions to `docker run` that depend on
 // the host's state at spawn time rather than on the session.
 type sandboxRunExtras struct {
-	yieldToPerson      bool
+	yieldToPerson bool
+	// noBlkioWeight drops --blkio-weight from the yieldToPerson weights: the Docker host cannot
+	// apply it (dockerAcceptsBlkioWeight). --cpu-shares stays.
+	noBlkioWeight      bool
 	workspaceRootMount string
 	workspaceMounts    []string
 	workspaceLabels    []string
@@ -534,7 +569,10 @@ func sandboxRunArgs(container, hostProjectPath, home string, env []string, extra
 		args = append(args, "--mount", extras.cloneObjects)
 	}
 	if extras.yieldToPerson {
-		args = append(args, "--cpu-shares", "128", "--blkio-weight", "100")
+		args = append(args, "--cpu-shares", "128")
+		if !extras.noBlkioWeight {
+			args = append(args, "--blkio-weight", "100")
+		}
 	}
 	if extras.network != "" {
 		args = append(args, "--network", extras.network)
@@ -654,7 +692,7 @@ func startSandboxContainer(sessionID, hostProjectPath string, env []string, cred
 		}
 		ensureSandboxLoginRefresh()
 	}
-	extras := sandboxRunExtras{yieldToPerson: opts.YieldToPerson, owner: sandboxOwner(), sandboxHome: sbHome, cloneObjects: cloneObjects, cliPath: messagingCLIPath(opts.RepoRoot), engine: opts.Engine, restrictedEngine: opts.RestrictedEngine, pluginCache: opts.PluginCache, codexHome: opts.CodexHome, codexSourceHome: opts.CodexSourceHome}
+	extras := sandboxRunExtras{yieldToPerson: opts.YieldToPerson, noBlkioWeight: opts.YieldToPerson && !dockerAcceptsBlkioWeight(), owner: sandboxOwner(), sandboxHome: sbHome, cloneObjects: cloneObjects, cliPath: messagingCLIPath(opts.RepoRoot), engine: opts.Engine, restrictedEngine: opts.RestrictedEngine, pluginCache: opts.PluginCache, codexHome: opts.CodexHome, codexSourceHome: opts.CodexSourceHome}
 	if opts.Workspace != nil {
 		extras.workspaceRootMount = plan.Mounts[0]
 		extras.workspaceMounts = append([]string(nil), plan.Mounts[1:]...)

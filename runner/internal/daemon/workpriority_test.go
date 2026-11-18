@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -97,5 +98,45 @@ func TestWorkerPrioritySandboxBoundary(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(normal, " "), "--cpu-shares") {
 		t.Fatal("cluster/default sandbox modified")
+	}
+}
+
+func TestSandboxDropsOnlyBlkioWeightWhenDockerCannotApplyIt(t *testing.T) {
+	args := strings.Join(sandboxRunArgs("fixture", "/srv/repo", "", nil, sandboxRunExtras{yieldToPerson: true, noBlkioWeight: true}), " ")
+	if !strings.Contains(args, "--cpu-shares 128") || strings.Contains(args, "--blkio-weight") {
+		t.Fatalf("args: %s", args)
+	}
+
+	reset := func() { blkioProbe.known, blkioProbe.supported = false, false }
+	old := dockerRun
+	t.Cleanup(func() { dockerRun = old; reset() })
+	probe := func(withFlag, without error) (bool, int) {
+		reset()
+		calls := 0
+		dockerRun = func(a ...string) error {
+			calls++
+			if slices.Contains(a, "--blkio-weight") {
+				return withFlag
+			}
+			return without
+		}
+		return dockerAcceptsBlkioWeight(), calls
+	}
+	boom := errors.New("exit status 127")
+	if ok, _ := probe(nil, nil); !ok {
+		t.Fatal("supported host reported unsupported")
+	}
+	if ok, _ := probe(boom, nil); ok {
+		t.Fatal("Docker Desktop host reported supported")
+	}
+	if _, calls := func() (bool, int) { // cached: no second probe
+		n := 0
+		dockerRun = func(...string) error { n++; return nil }
+		return dockerAcceptsBlkioWeight(), n
+	}(); calls != 0 {
+		t.Fatal("probe not cached")
+	}
+	if ok, _ := probe(boom, boom); !ok || blkioProbe.known {
+		t.Fatal("an unknown result must keep the flag and not be cached")
 	}
 }
